@@ -1,0 +1,34 @@
+# --- Config & environment ---
+python-dotenv>=1.0.0
+
+# --- Crawling (Phase 2) ---
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+tenacity>=8.2.0
+
+# --- Chunking (Phase 3) ---
+langchain-text-splitters>=0.2.0
+
+# --- Local embeddings (Phase 4) ---
+# sentence-transformers pulls in torch automatically; on a CPU-only machine
+# this is a large-ish install (a few GB) but requires no GPU and no API key.
+sentence-transformers>=3.0.0
+# LangChain integration for Hugging Face / sentence-transformers embeddings.
+langchain-huggingface>=0.1.0
+
+# --- Vector database (Phase 4) ---
+chromadb>=0.5.0
+
+# --- RAG pipeline / LLM (Phase 5) ---
+langchain>=0.2.0
+langchain-google-genai>=1.0.0
+langchain-chroma>=0.1.0
+
+# --- Chat UI (Phase 6) ---
+streamlit>=1.35.0
+
+# --- Testing / bonus hit-rate evaluation (Phase 7) ---
+pytest>=8.0.0
+
+# --- Lexical retrieval ---
+rank-bm25>=0.2.2

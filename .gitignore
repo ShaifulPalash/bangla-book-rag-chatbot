@@ -1,0 +1,29 @@
+# Secrets — never commit your real API key
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# Runtime-generated data — these are rebuilt by running the pipeline,
+# so there's no need to bloat the repo with them. Only the *code* that
+# generates them is committed.
+logs/*
+!logs/.gitkeep
+
+chroma_db/*
+!chroma_db/.gitkeep
+
+data/*
+!data/.gitkeep
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
