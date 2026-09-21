@@ -50,536 +50,760 @@ A Bengali Knowledge-Base Chatbot Powered by Retrieval-Augmented Generation
 
 ---
 
-## 🔎 Overview
+## 📖 Overview
 
-**বাংলা বই RAG চ্যাটবট** is a Retrieval-Augmented Generation (RAG) application designed to answer questions about the Bengali novel ***দেবদাস*** by **শরৎচন্দ্র চট্টোপাধ্যায়**.
+This project implements a **Knowledge Base Chatbot** using a Retrieval-Augmented Generation (RAG) architecture.
 
-The system retrieves relevant passages from the book before generating an answer with an LLM. This grounding approach helps keep responses focused on the provided knowledge base rather than relying on the model's general knowledge.
+The chatbot retrieves relevant passages from a Bengali prose book and uses **Google Gemini** to generate answers grounded exclusively in the retrieved book content.
 
-The application follows a strict knowledge-base rule:
+The retrieval layer uses a **hybrid search architecture** that combines:
 
-> **Answers must be grounded in the book's retrieved content. If the requested information cannot be found in the book, the chatbot should clearly indicate that the information is not available in the knowledge base.**
+- **BGE-M3** dense semantic retrieval
+- **BM25** lexical retrieval
+- **Weighted Reciprocal Rank Fusion (RRF)**
+- Configurable **Top-K** passage selection
 
-Each generated response can be traced back to the relevant book chapter or section through citation metadata.
+This approach combines semantic understanding with exact lexical matching, which is particularly useful for Bengali text, character names, and explicit terms appearing in the source material.
 
-### Core Pipeline
+The application provides a simple **Streamlit chat interface** where users can ask questions in Bengali.
+
+---
+
+## 🎯 Key Features
+
+- 📚 Bengali book knowledge base
+- 🕷️ Automated crawling from Bengali Wikisource
+- 🧹 HTML cleaning and text preprocessing
+- ✂️ Chapter-aware text chunking
+- 🧠 Local **BAAI/bge-m3** embeddings
+- 🔎 Hybrid retrieval using:
+  - BGE-M3 dense search
+  - BM25 lexical search
+- 🔀 Weighted Reciprocal Rank Fusion (RRF)
+- 📌 Configurable Top-K retrieval
+- 🤖 Google Gemini for grounded answer generation
+- 🛡️ Refuses questions when the requested information is not supported by the book
+- 📖 Chapter-based source attribution
+- 💾 Persistent ChromaDB vector store
+- 💬 Streamlit-based conversational UI
+- 🔁 Retry handling for transient LLM/API failures
+- 🧪 Offline/unit testing without consuming Gemini API quota
+- 🌐 Optional live end-to-end Gemini evaluation
+- 📝 Application logging
+
+---
+
+## 🏗️ System Architecture
 
 ```text
-Bengali Wikisource
-       │
-       ▼
-Book Crawling
-       │
-       ▼
-Text Cleaning
-       │
-       ▼
-Chunking + Metadata
-       │
-       ▼
-BGE-M3 Embeddings
-       │
-       ▼
-Chroma Vector Database
-       │
-       ▼
-Similarity Retrieval
-       │
-       ▼
-Gemini 3.6 Flash
-       │
-       ▼
-Answer + Source Citation
-```
-
----
-
-## ✨ Key Features
-
-* 📚 **Book-specific knowledge base** based on the Bengali novel *দেবদাস*
-* 🌐 **Automated Wikisource ingestion** using the MediaWiki API
-* 🧹 **Content cleaning** to remove navigation and non-story elements
-* ✂️ **Semantic-friendly text chunking** with configurable chunk size and overlap
-* 🤗 **Local multilingual embeddings** using `BAAI/bge-m3`
-* 🗄️ **Persistent Chroma vector database** for efficient similarity search
-* 🔎 **Configurable top-k retrieval**
-* 🤖 **Gemini 3.6 Flash** for answer generation
-* 📖 **Chapter-aware citations** for retrieved sources
-* 🛡️ **Grounded-answer behavior** to reduce unsupported responses
-* 🔁 **Retry with exponential backoff** for transient API failures
-* 📝 **Centralized configuration and logging**
-* 💬 **Streamlit chat interface**
-* 🧪 **Automated retrieval test suite**
-* 📊 **Optional retrieval comparison experiment**
-
----
-
-## 📚 Book Information
-
-| Field           | Details                                                                                   |
-| --------------- | ----------------------------------------------------------------------------------------- |
-| **Title**       | দেবদাস (Debdas)                                                                           |
-| **Author**      | শরৎচন্দ্র চট্টোপাধ্যায় (Sarat Chandra Chattopadhyay)                                     |
-| **Language**    | Bengali                                                                                   |
-| **Chapters**    | 16 (পরিচ্ছেদ ১–১৬)                                                                        |
-| **Source**      | [Bengali Wikisource](https://bn.wikisource.org/wiki/দেবদাস_%28শরৎচন্দ্র_চট্টোপাধ্যায়%29) |
-| **Book Status** | Public domain                                                                             |
-
-The application uses the Bengali Wikisource edition as its knowledge source. The crawler discovers the book's chapter subpages and stores the cleaned chapter content together with source metadata.
-
----
-
-## 🏗 System Architecture
-
-```mermaid
-flowchart TD
-    A[Bengali Wikisource] --> B[MediaWiki API]
-    B --> C[Book Crawler]
-    C --> D[HTML Cleaning]
-    D --> E[Chapter Documents]
-    E --> F[Text Chunking]
-    F --> G[BGE-M3 Embeddings]
-    G --> H[Chroma Vector Database]
-
-    U[User Question] --> I[Retriever]
-    I --> H
-    H --> J[Relevant Book Chunks]
-    J --> K[Prompt Construction]
-    K --> L[Gemini 3.6 Flash]
-    L --> M[Grounded Answer]
-    J --> N[Chapter Metadata]
-    M --> O[Answer + Citation]
-    N --> O
-```
+                    Bengali Book
+                         │
+                         ▼
+              Bengali Wikisource
+                         │
+                         ▼
+                    Web Crawler
+                         │
+                         ▼
+                 HTML Cleaning
+                         │
+                         ▼
+               Chapter-aware Chunking
+                         │
+                         ▼
+                 ┌───────────────┐
+                 │ Book Chunks   │
+                 └───────────────┘
+                         │
+             ┌───────────┴───────────┐
+             ▼                       ▼
+      BGE-M3 Embeddings          BM25 Index
+             │                       │
+             ▼                       ▼
+      Dense Retrieval          Lexical Retrieval
+             │                       │
+             └───────────┬───────────┘
+                         ▼
+                 Weighted RRF Fusion
+                         │
+                         ▼
+                     Top-K Passages
+                         │
+                         ▼
+                  Grounded Prompt
+                         │
+                         ▼
+                  Google Gemini
+                         │
+                         ▼
+                  Bengali Answer
+                         │
+                         ▼
+                 Chapter Citations
+````
 
 ---
 
 ## 🔄 How the RAG Pipeline Works
 
-The chatbot follows a standard Retrieval-Augmented Generation architecture.
+### 1. Data Collection
 
-### 1. Ingestion
+The crawler retrieves the book and its chapter subpages from Bengali Wikisource.
 
-The crawler retrieves the book's chapter pages from Bengali Wikisource through the MediaWiki API.
-
-### 2. Cleaning
-
-The downloaded chapter content is cleaned to remove elements that are not part of the actual story, such as:
-
-* Navigation elements
-* Edit links
-* Footnote markers
-* Navigation tables
-* Unnecessary page metadata
-* Source/footer clutter
-
-### 3. Chunking
-
-Each chapter is divided into smaller text chunks. Chunk metadata preserves information such as:
-
-* Book name
-* Author
-* Chapter number
-* Chapter name
-* Source URL
-
-This metadata is later used to provide meaningful citations.
-
-### 4. Embedding
-
-Each text chunk is converted into a numerical vector using the multilingual **`BAAI/bge-m3`** embedding model.
-
-The embeddings are generated locally through the Hugging Face integration rather than using a separate hosted embedding API.
-
-### 5. Vector Storage
-
-The generated embeddings and associated metadata are stored in a persistent **Chroma** vector database.
-
-### 6. Retrieval
-
-When a user asks a question, the question is converted into an embedding and compared against the stored document vectors.
-
-The most relevant chunks are retrieved according to the configured `TOP_K` value.
-
-### 7. Generation
-
-The retrieved book passages are supplied as context to **Gemini 3.6 Flash**.
-
-The LLM is instructed to answer using the retrieved book content rather than relying on unsupported external knowledge.
-
-### 8. Citation
-
-The retrieved chunks retain their original chapter metadata, allowing the application to identify the relevant chapter or section associated with the answer.
-
----
-
-## 🗂 Project Structure
-
-```text
-bangla-book-rag-chatbot/
-│
-├── src/
-│   ├── config.py              # Central configuration and logging
-│   ├── crawler.py             # Wikisource book crawler
-│   ├── chunking.py            # Text splitting and metadata creation
-│   ├── embeddings.py          # BGE-M3 embedding configuration
-│   ├── vectordb.py            # Chroma vector database creation
-│   └── rag_pipeline.py        # Retriever + Gemini RAG pipeline
-│
-├── tests/
-│   └── test_retrieval.py      # Retrieval and test-question validation
-│
-├── data/
-│   ├── raw_debdas.json        # Crawled and cleaned book content
-│   └── debdas_chunks.json     # Chunked book content
-│
-├── chroma_db/                 # Persisted Chroma database (git-ignored)
-├── logs/                      # Application logs (git-ignored)
-├── screenshots/               # Project screenshots
-│
-├── app.py                     # Streamlit application
-├── .env.example               # Environment-variable template
-├── .gitignore
-├── requirements.txt
-├── LICENSE
-└── README.md
-```
-
----
-
-## 🧰 Technology Stack
-
-| Component                 | Technology                                |
-| ------------------------- | ----------------------------------------- |
-| **Language**              | Python 3.10+                              |
-| **RAG Framework**         | LangChain                                 |
-| **LLM**                   | Gemini 3.6 Flash                          |
-| **Embedding Model**       | `BAAI/bge-m3`                             |
-| **Embedding Integration** | `langchain-huggingface`                   |
-| **Vector Database**       | Chroma                                    |
-| **Web/Data Source**       | Bengali Wikisource                        |
-| **API**                   | MediaWiki API                             |
-| **Web Parsing**           | BeautifulSoup                             |
-| **Retry Handling**        | Tenacity                                  |
-| **User Interface**        | Streamlit                                 |
-| **Testing**               | Pytest                                    |
-| **Configuration**         | `.env` + centralized Python configuration |
-
----
-
-## 🛠 Setup & Installation
-
-### Prerequisites
-
-Make sure the following are installed:
-
-* Python 3.10 or newer
-* Git
-* A Google Gemini API key
-* Sufficient local disk space for the embedding model and vector database
-
-### 1. Clone the Repository
-
-```bash
-git clone <your-repository-url>
-cd bangla-book-rag-chatbot
-```
-
-### 2. Create a Virtual Environment
-
-Linux / macOS / WSL:
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-```
-
-Windows:
-
-```powershell
-python -m venv .venv
-.venv\Scripts\activate
-```
-
-### 3. Upgrade pip
-
-```bash
-python -m pip install --upgrade pip
-```
-
-### 4. Install Dependencies
-
-```bash
-pip install -r requirements.txt
-```
-
-The project uses `langchain-huggingface` to integrate the local Hugging Face embedding model with the LangChain pipeline.
-
-### 5. Configure the Gemini API Key
-
-Create a `.env` file from the provided example:
-
-```bash
-cp .env.example .env
-```
-
-Then add your Gemini API key:
-
-```env
-GOOGLE_API_KEY=your_gemini_api_key
-```
-
-Do not commit `.env` to Git. API credentials should remain private.
-
----
-
-## ⚙️ Configuration
-
-Application settings are centralized in `src/config.py` and can be loaded from environment variables.
-
-The main configuration categories include:
-
-```text
-API credentials
-LLM model
-Embedding model
-Chunk size
-Chunk overlap
-Retriever TOP_K
-Vector database path
-Logging configuration
-```
-
-### Example RAG Configuration
-
-```python
-llm_model = "gemini-3.6-flash"
-embedding_model = "BAAI/bge-m3"
-```
-
-The retriever's `TOP_K` value controls how many relevant chunks are returned for each user question.
-
-For example:
-
-```python
-TOP_K = int(os.getenv("TOP_K", "6"))
-```
-
-Keeping these values configurable makes it easier to experiment with retrieval quality without modifying the core RAG pipeline.
-
----
-
-## ▶️ Running the Project
-
-The project is designed to be executed in three main stages.
-
-### Step 1 — Crawl the Book
-
-Run the crawler to download and clean the book content:
-
-```bash
-python src/crawler.py
-```
-
-This generates:
+The collected content is stored locally as structured JSON data.
 
 ```text
 data/raw_debdas.json
 ```
 
-The file contains the cleaned chapter-level book content and source metadata.
+---
 
-### Step 2 — Build the Vector Database
+### 2. Text Cleaning
 
-Generate chunks, embeddings, and the persistent Chroma vector database:
+HTML content is processed to remove irrelevant elements such as:
+
+* Navigation elements
+* Scripts
+* Styles
+* Page controls
+* Other non-book content
+
+The result is clean Bengali prose suitable for downstream processing.
+
+---
+
+### 3. Text Chunking
+
+The cleaned book text is divided into smaller chunks while preserving important metadata.
+
+Each chunk contains information such as:
+
+* Book name
+* Author
+* Chapter number
+* Chapter name
+* Section
+* Source URL
+* Chunk index
+* Text content
+
+The processed chunks are stored in:
+
+```text
+data/debdas_chunks.json
+```
+
+---
+
+### 4. Dense Retrieval
+
+The project uses:
+
+**`BAAI/bge-m3`**
+
+to generate local embeddings for the book chunks.
+
+Dense retrieval captures **semantic similarity**, allowing the system to retrieve relevant passages even when the wording of the question differs from the wording in the book.
+
+The embeddings are stored in a persistent **ChromaDB** vector database.
+
+---
+
+### 5. Lexical Retrieval
+
+The project also uses **BM25** for lexical retrieval.
+
+BM25 is useful when the query contains:
+
+* Character names
+* Specific Bengali terms
+* Explicit phrases
+* Words that appear directly in the source text
+
+Bengali text is normalized and tokenized using Unicode-aware preprocessing before BM25 indexing.
+
+---
+
+### 6. Hybrid Retrieval
+
+Dense and lexical retrieval are combined using **Weighted Reciprocal Rank Fusion (RRF)**.
+
+```text
+Hybrid Retrieval
+├── BGE-M3 dense retrieval
+└── BM25 lexical retrieval
+        ↓
+Weighted RRF
+        ↓
+Top-K passages
+```
+
+This allows the system to benefit from both semantic and exact lexical matching.
+
+The current default configuration retrieves:
+
+```text
+TOP_K = 6
+```
+
+---
+
+### 7. Grounded Answer Generation
+
+The retrieved passages are inserted into a structured prompt and sent to Google Gemini.
+
+The model is instructed to:
+
+1. Answer only from the provided book context.
+2. Combine information from multiple retrieved passages when necessary.
+3. Respond in Bengali.
+4. Mention relevant chapter names.
+5. Avoid inventing information.
+6. Return a predefined refusal message when the answer is not supported by the book.
+
+The refusal phrase is:
+
+```text
+এই তথ্যটি বইয়ে পাওয়া যায়নি।
+```
+
+---
+
+### 8. Source Attribution
+
+For supported questions, the application displays the relevant chapter names associated with the retrieved context.
+
+This provides users with a transparent indication of where the answer was grounded.
+
+---
+
+## 📚 Book Information
+
+The current knowledge base uses:
+
+| Property        | Value                   |
+| --------------- | ----------------------- |
+| Book            | দেবদাস                  |
+| Author          | শরৎচন্দ্র চট্টোপাধ্যায় |
+| Source          | Bengali Wikisource      |
+| Chapters        | 16                      |
+| Language        | Bengali                 |
+| Retrieval       | Hybrid Dense + BM25     |
+| Embedding Model | BAAI/bge-m3             |
+| Vector Database | ChromaDB                |
+| LLM             | Google Gemini           |
+
+---
+
+## 🛠️ Technology Stack
+
+| Component         | Technology                      |
+| ----------------- | ------------------------------- |
+| Language          | Python 3.12+                    |
+| Data Source       | Bengali Wikisource              |
+| Web Crawling      | Requests + BeautifulSoup        |
+| Text Splitting    | LangChain Text Splitters        |
+| Embeddings        | BAAI/bge-m3                     |
+| Dense Retrieval   | ChromaDB                        |
+| Lexical Retrieval | BM25                            |
+| Hybrid Fusion     | Weighted Reciprocal Rank Fusion |
+| LLM               | Google Gemini                   |
+| RAG Framework     | LangChain                       |
+| UI                | Streamlit                       |
+| Testing           | Pytest                          |
+| Configuration     | python-dotenv                   |
+| Logging           | Python logging                  |
+
+---
+
+## 📁 Project Structure
+
+```text
+bangla-book-rag-chatbot/
+│
+├── data/
+│   ├── raw_debdas.json
+│   └── debdas_chunks.json
+│
+├── chroma_db/
+│   ├── chroma.sqlite3
+│   └── ...
+│
+├── docs/
+│   └── test_results.md
+│
+├── logs/
+│   └── app.log
+│
+├── src/
+│   ├── __init__.py
+│   ├── config.py
+│   ├── crawler.py
+│   ├── chunking.py
+│   ├── embeddings.py
+│   ├── vectordb.py
+│   ├── lexical_retrieval.py
+│   ├── hybrid_retrieval.py
+│   └── rag_pipeline.py
+│
+├── tests/
+│   └── test_retrieval.py
+│
+├── .env
+├── .env.example
+├── .gitignore
+├── app.py
+├── DEMO_SCRIPT.md
+├── LICENSE
+├── README.md
+└── requirements.txt
+```
+
+---
+
+## ⚙️ Setup
+
+### 1. Clone the Repository
+
+```bash
+git clone https://github.com/ShaifulPalash/bangla-book-rag-chatbot.git
+cd bangla-book-rag-chatbot
+```
+
+---
+
+### 2. Create a Virtual Environment
+
+Create a dedicated Python virtual environment:
+
+```bash
+python3 -m venv .venv
+```
+
+Activate it:
+
+```bash
+source .venv/bin/activate
+```
+
+Verify Python:
+
+```bash
+python --version
+```
+
+Python 3.12+ is recommended.
+
+---
+
+### 3. Install Dependencies
+
+Install the required packages:
+
+```bash
+pip install -r requirements.txt
+```
+
+---
+
+### 4. Configure Environment Variables
+
+Create a `.env` file from the example:
+
+```bash
+cp .env.example .env
+```
+
+Open the file:
+
+```bash
+nano .env
+```
+
+Add your Google Gemini API key:
+
+```env
+GOOGLE_API_KEY=your_gemini_api_key
+```
+
+Do not commit `.env` to Git.
+
+The `.gitignore` file already excludes it from version control.
+
+---
+
+## 🔑 API Key
+
+The application requires a Google Gemini API key for answer generation.
+
+The API key is used only for the LLM generation stage. The embedding model runs locally using `BAAI/bge-m3`.
+
+This design reduces dependency on external embedding APIs and helps minimize API usage.
+
+---
+
+## 🔧 Configuration
+
+Application settings are managed in:
+
+```text
+src/config.py
+```
+
+The current default retrieval configuration includes:
+
+```python
+TOP_K = int(os.getenv("TOP_K", "6"))
+```
+
+This means the system retrieves **6 passages by default** after hybrid retrieval and RRF fusion.
+
+You can change the value through the environment:
+
+```env
+TOP_K=6
+```
+
+Increasing `TOP_K` may provide more context to the LLM, while a smaller value can reduce the amount of retrieved context.
+
+---
+
+## ▶️ Running the Project
+
+The project should be run in the following order when building the knowledge base from scratch.
+
+### Step 1 — Crawl the Book
+
+Run:
+
+```bash
+python src/crawler.py
+```
+
+This retrieves the book chapters and saves the raw content to:
+
+```text
+data/raw_debdas.json
+```
+
+---
+
+### Step 2 — Create Chunks
+
+Run:
+
+```bash
+python src/chunking.py
+```
+
+This processes the raw book content and creates chapter-aware text chunks.
+
+Output:
+
+```text
+data/debdas_chunks.json
+```
+
+---
+
+### Step 3 — Build the Vector Database
+
+Run:
 
 ```bash
 python src/vectordb.py
 ```
 
-The resulting vector store is saved under:
+This:
+
+* Loads the processed chunks
+* Generates local BGE-M3 embeddings
+* Stores the embeddings in ChromaDB
+* Creates the persistent vector database
+
+Output:
 
 ```text
 chroma_db/
 ```
 
-The vector database is intentionally excluded from Git because it is a generated artifact.
+The BM25 lexical index is built automatically at runtime from:
 
-### Step 3 — Launch the Streamlit Application
+```text
+data/debdas_chunks.json
+```
 
-Start the chatbot interface:
+---
+
+### Step 4 — Start the Streamlit Application
+
+Run:
 
 ```bash
 streamlit run app.py
 ```
 
-Streamlit will provide a local URL where the chatbot can be accessed through a web browser.
+Streamlit will display a local URL in the terminal.
+
+Open that URL in your browser to use the chatbot.
 
 ---
 
-## 🔬 Technical Details
+## 🔄 Complete Rebuild
 
-### Book Ingestion
+If you want to rebuild the complete knowledge base from scratch:
 
-The book is ingested through the **MediaWiki API** provided by Bengali Wikisource.
-
-Instead of relying on fragile HTML URL assumptions, the crawler uses the API to discover the book's chapter pages.
-
-The crawler:
-
-1. Identifies the book's chapter subpages.
-2. Retrieves chapter content through the MediaWiki API.
-3. Extracts the relevant HTML content.
-4. Cleans unwanted page elements.
-5. Preserves chapter-level metadata.
-6. Saves the processed content as structured JSON.
-
-The chapter discovery process allows the crawler to identify the available chapter pages rather than relying solely on manually hardcoded page URLs.
-
-### Resilience
-
-Network operations are protected with retry logic and exponential backoff.
-
-A polite delay between requests is used to avoid unnecessarily aggressive API traffic.
-
-A descriptive `User-Agent` is also provided for API requests.
-
-A failure affecting one chapter should not unnecessarily terminate the entire ingestion process.
+```bash
+python src/crawler.py
+python src/chunking.py
+python src/vectordb.py
+streamlit run app.py
+```
 
 ---
 
-### Chunking Strategy
+## 💬 Example Questions
 
-The book is divided into smaller chunks before embedding.
+The chatbot is designed to answer questions that can be supported by the book.
 
-Chunking is necessary because sending an entire book to the LLM for every question would be inefficient and would make retrieval much less precise.
+Examples:
 
-The chunking configuration is centralized so that chunk size and overlap can be adjusted experimentally.
+```text
+দেবদাসের শৈশব কেমন ছিল?
+
+দেবদাস ও পার্বতীর সম্পর্ক কেমন ছিল?
+
+দেবদাসের পিতার সাথে তার সম্পর্ক কেমন ছিল?
+
+চন্দ্রমুখী দেবদাসের জীবনে কী ভূমিকা পালন করেছিল?
+```
+
+For information that cannot be supported by the book, the chatbot should respond:
+
+```text
+এই তথ্যটি বইয়ে পাওয়া যায়নি।
+```
+
+---
+
+## 🧪 Testing
+
+The project separates **offline/unit testing** from **live Gemini evaluation**.
+
+This prevents routine test execution from unnecessarily consuming Gemini API quota.
+
+### Run Offline Tests
+
+Run:
+
+```bash
+pytest -q
+```
+
+These tests are intended to run without making live Gemini API requests.
+
+They can be used during normal development and CI workflows.
+
+---
+
+### Check Test Collection
+
+To verify which tests are being collected:
+
+```bash
+pytest -q --collect-only
+```
+
+---
+
+### Run Live Gemini Evaluation
+
+For actual end-to-end evaluation using the Gemini API:
+
+```bash
+RUN_LIVE_TESTS=1 python tests/test_retrieval.py
+```
+
+This performs live evaluation using the configured Gemini API key.
+
+Live evaluation requires:
+
+* A valid `GOOGLE_API_KEY`
+* Internet connectivity
+* Available Gemini API quota
+* Access to the configured Gemini model
+
+Because live tests consume API quota, they should be run intentionally rather than on every local test execution.
+
+---
+
+## 📊 Evaluation Dataset
+
+The retrieval evaluation contains questions designed to test both supported and unsupported queries.
+
+The test set includes:
+
+* In-book questions
+* Character-related questions
+* Relationship-based questions
+* Chapter-specific questions
+* An out-of-book question
+
+For supported questions, the evaluation checks that:
+
+* The chatbot does not refuse the question.
+* A non-empty answer is generated.
+* Relevant sources are returned.
+* Expected Bengali keywords are present.
+
+For unsupported questions, the evaluation checks that the chatbot returns the predefined refusal response.
+
+Detailed test information is documented in:
+
+```text
+docs/test_results.md
+```
+
+---
+
+## 🔍 Retrieval Design
+
+### Dense Retrieval
+
+Dense retrieval uses BGE-M3 embeddings to identify semantically related passages.
+
+Advantages:
+
+* Handles semantic similarity
+* Works when query wording differs from source wording
+* Useful for conceptual questions
+
+---
+
+### BM25 Retrieval
+
+BM25 performs lexical matching between the question and book chunks.
+
+Advantages:
+
+* Strong exact-term matching
+* Useful for names and explicit terms
+* Helps retrieve passages containing important Bengali words
+
+---
+
+### Weighted RRF
+
+The results from both retrievers are combined using Weighted Reciprocal Rank Fusion.
 
 Conceptually:
 
 ```text
-Chapter
-   │
-   ├── Chunk 1
-   ├── Chunk 2
-   ├── Chunk 3
-   ├── ...
-   └── Chunk N
+RRF Score =
+    Dense Weight / (RRF_K + Dense Rank)
+    +
+    Lexical Weight / (RRF_K + Lexical Rank)
 ```
 
-Each chunk retains its source metadata so that retrieval results remain traceable to their original chapter.
+The current configuration uses:
+
+```text
+RRF_K = 60
+
+Dense Weight   = 1.0
+Lexical Weight = 2.0
+```
+
+The higher lexical weight gives BM25 a stronger contribution to the final ranking.
 
 ---
 
-### Embedding Model
+## 🧠 Why Hybrid Retrieval?
 
-The project uses:
+A Bengali knowledge base benefits from combining semantic and lexical retrieval.
 
-```text
-BAAI/bge-m3
-```
+For example, a question may contain an important character name or Bengali term that appears explicitly in the source. BM25 can strongly identify such passages, while dense retrieval can capture relevant passages even when the wording differs.
 
-The model is integrated through:
+The hybrid approach therefore provides two complementary retrieval signals:
 
 ```text
-langchain-huggingface
+Semantic Understanding
+        +
+Exact Lexical Matching
+        ↓
+Hybrid Retrieval
+        ↓
+Weighted RRF
+        ↓
+Improved Candidate Ranking
 ```
-
-The embedding model is run locally rather than relying on a separate hosted embedding API.
-
-This provides:
-
-* Multilingual embedding capability
-* Bengali text support
-* Local inference
-* Reduced dependency on embedding API quotas
-* Reproducible embedding generation
-
-The embedding model converts both book chunks and user queries into vector representations that can be compared during retrieval.
 
 ---
 
-### Vector Database
+## 🛡️ Grounding and Hallucination Control
 
-The project uses **Chroma** as its persistent vector database.
+The chatbot is designed to keep generated answers grounded in the retrieved book content.
 
-Chroma stores:
+The generation prompt instructs the model to:
 
-* Document embeddings
-* Text chunks
-* Metadata
-* Collection information
+* Use only the supplied context.
+* Avoid unsupported claims.
+* Combine multiple passages when necessary.
+* Answer in Bengali.
+* Cite chapter names.
+* Refuse unsupported questions.
 
-The persistent database allows the application to reuse the generated embeddings without rebuilding the entire index every time the Streamlit application starts.
-
-The generated database is stored in:
+The system uses the following refusal response:
 
 ```text
-chroma_db/
+এই তথ্যটি বইয়ে পাওয়া যায়নি।
 ```
 
-and is excluded from version control.
+This provides a simple mechanism for handling questions outside the knowledge base.
 
 ---
 
-### Retriever & LLM
+## 🔐 Security Considerations
 
-The retrieval stage uses similarity search against the Chroma vector database.
+### API Keys
 
-The number of retrieved documents is controlled by `TOP_K`.
+Never commit API keys to Git.
 
-Example:
-
-```python
-TOP_K = 6
-```
-
-The retrieved passages are then passed to the LLM as contextual evidence.
-
-The configured generation model is:
+The `.env` file should remain local:
 
 ```text
-Gemini 3.6 Flash
+.env
 ```
 
-The model is responsible for generating the final natural-language response from the retrieved book passages.
+Only `.env.example` should be committed.
 
 ---
 
-### Prompt & Grounding
+### Local Embeddings
 
-The RAG prompt is designed around the principle that the chatbot should prioritize the supplied book context.
+BGE-M3 embeddings are generated locally rather than through an external embedding API.
 
-The intended behavior is:
-
-```text
-User Question
-      │
-      ▼
-Retrieve relevant book passages
-      │
-      ▼
-Provide passages to LLM
-      │
-      ▼
-Generate answer from retrieved context
-      │
-      ├── Information found
-      │       └── Answer + citation
-      │
-      └── Information not found
-              └── Clearly state that the answer
-                  is not available in the book
-```
-
-This approach helps reduce unsupported answers and keeps the chatbot focused on the selected knowledge base.
+This helps reduce exposure of book content to external embedding services and minimizes API usage.
 
 ---
 
-### Logging & Error Handling
+### Persistent Data
 
-The project uses centralized logging and error handling.
+The following generated files are environment-specific and should generally not be committed:
+
+```text
+.env
+.venv/
+chroma_db/chroma.sqlite3
+logs/app.log
+data/*.json
+```
+
+The repository's `.gitignore` is configured accordingly.
+
+---
+
+## 📝 Logging
 
 Application logs are written to:
 
@@ -587,180 +811,107 @@ Application logs are written to:
 logs/app.log
 ```
 
-The logging system is configured through `src/config.py`.
+Logging can help with debugging:
 
-The project also uses retry mechanisms for transient network and API failures.
-
-Key configuration values are centralized to avoid scattering model names, API settings, retrieval parameters, and other application settings throughout the codebase.
-
----
-
-## 🧪 Testing
-
-The project includes automated tests for the retrieval workflow and predefined test questions.
-
-Run the complete test suite with:
-
-```bash
-pytest -q
-```
-
-To inspect test collection before execution:
-
-```bash
-pytest -q --collect-only
-```
-
-The test suite is designed to verify that the retrieval system can locate relevant passages for representative questions from the book.
-
-### Test Questions
-
-The evaluation set includes questions covering different types of information, such as:
-
-* Character-related questions
-* Events and relationships
-* Locations
-* Story details
-* Chapter-specific information
-* Questions whose answers should not be available in the knowledge base
-
-The expected behavior is evaluated based on the retrieved context and source metadata rather than relying only on surface-level text matching.
+* Retrieval behavior
+* RAG pipeline execution
+* API errors
+* Runtime issues
 
 ---
 
-## 🖼 Screenshots
+## 🚀 Performance Considerations
 
-Project screenshots are stored in:
+The project uses several techniques to reduce unnecessary computation:
 
-```text
-screenshots/
-```
+* Local embeddings
+* Persistent ChromaDB storage
+* Cached BM25 index construction
+* Configurable Top-K retrieval
+* Limited dense and lexical candidate sets
+* Optional live evaluation rather than mandatory API-based testing
 
-### Pipeline Execution
-
-![Pipeline Running](screenshots/pipeline_running.png)
-
-### Sample Question & Answer
-
-![Sample Answer](screenshots/sample_answer.png)
-
-### No-Answer / Out-of-Scope Case
-
-![No Answer Case](screenshots/no_answer_case.png)
+The first embedding/database build may take longer because BGE-M3 must process the complete knowledge base.
 
 ---
 
-## 🎥 Demo Video
+## 🧩 Design Principles
 
-A demonstration video showing the complete application workflow can be added here.
+The project follows several practical RAG engineering principles:
 
-The recommended demonstration flow is:
-
-1. Start the application.
-2. Show the chatbot interface.
-3. Ask a question about the book.
-4. Show the generated answer.
-5. Show the corresponding chapter/source citation.
-6. Ask a question whose answer is not present in the book.
-7. Demonstrate the chatbot's grounded no-answer behavior.
-
-**Demo:** *Add video link here.*
-
----
-
-## 🏅 Retrieval Comparison Experiment
-
-As an optional experiment, the project can compare different retrieval configurations.
-
-Possible experiments include:
-
-* Different chunk sizes
-* Different chunk overlaps
-* Different `TOP_K` values
-* Alternative embedding models
-
-A simple evaluation can measure whether the retrieved chunks contain the expected chapter or relevant information for a predefined set of questions.
-
-Example:
-
-```text
-Test Questions
-      │
-      ├── Configuration A
-      │      └── Retrieval Results
-      │
-      └── Configuration B
-             └── Retrieval Results
-```
-
-This provides a practical way to understand how chunking and retrieval configuration affect RAG performance.
+1. **Separate data ingestion from retrieval.**
+2. **Keep embeddings local where practical.**
+3. **Use hybrid retrieval for complementary search signals.**
+4. **Preserve source metadata throughout the pipeline.**
+5. **Ground LLM responses in retrieved context.**
+6. **Provide source attribution.**
+7. **Handle unsupported questions explicitly.**
+8. **Separate offline tests from API-dependent evaluation.**
+9. **Keep secrets outside version control.**
+10. **Use persistent vector storage for repeatable application runs.**
 
 ---
 
-## 🚀 Future Improvements
+## 🔮 Future Improvements
 
 Potential improvements include:
 
-* Add support for multiple Bengali books through configuration
-* Improve retrieval with hybrid search
-* Add reranking for retrieved passages
-* Add conversation history with controlled context management
-* Add richer source citations with exact passage references
-* Add automated retrieval evaluation metrics
-* Add CI checks for tests and code quality
+* Add a dedicated reranking stage after hybrid retrieval
+* Evaluate different BM25 and RRF weight combinations
+* Add retrieval metrics such as Recall@K and MRR
+* Expand the evaluation dataset
+* Add automated retrieval benchmarking
+* Improve Bengali-specific tokenization
+* Add conversation history management
+* Add multilingual query support
+* Introduce metadata-aware filtering
+* Improve citation granularity down to individual passages
 * Add Docker-based deployment
-* Add static type checking with `mypy`
-* Add configurable retrieval strategies
-* Improve Bengali-specific text preprocessing
-
-These improvements are intentionally kept outside the core implementation so that the current project remains focused on a book-specific RAG chatbot.
+* Add CI-based automated testing and linting
 
 ---
 
-## 🔐 Security & Privacy
+## 📌 Limitations
 
-* API keys must be stored in `.env`.
-* `.env` must not be committed to Git.
-* Generated vector databases are excluded from version control.
-* Runtime logs should not contain sensitive credentials.
-* Never hardcode API keys directly into source files.
+The chatbot is intentionally limited to the content available in its knowledge base.
 
-Before pushing the repository, verify:
+Therefore:
 
-```bash
-git status
-```
-
-and make sure `.env` is not included in the files being committed.
+* It cannot reliably answer questions unrelated to the book.
+* Answer quality depends on retrieval quality.
+* Gemini API availability and quota affect live evaluation.
+* Local BGE-M3 inference can require significant CPU/RAM resources.
+* Bengali tokenization can be more challenging than English tokenization.
+* Retrieved chapter sources indicate the supporting retrieval context but do not necessarily mean every listed chapter was directly used in the final generated answer.
 
 ---
 
 ## 📄 License
 
-This project is licensed under the **MIT License**. See the [`LICENSE`](LICENSE) file for details.
+This project is licensed under the MIT License.
 
-The book text used as the knowledge source is obtained from Bengali Wikisource and is in the public domain.
-
-Source:
-
-[Bengali Wikisource — দেবদাস](https://bn.wikisource.org/wiki/দেবদাস_%28শরৎচন্দ্র_চট্টোপাধ্যায়%29)
+See the [LICENSE](LICENSE) file for details.
 
 ---
 
 ## 🙏 Acknowledgements
 
-* [Bengali Wikisource](https://bn.wikisource.org/) — source of the book text
-* [LangChain](https://www.langchain.com/) — RAG application framework
-* [Google Gemini](https://ai.google.dev/) — language model
-* [Hugging Face](https://huggingface.co/) — embedding model ecosystem
-* [BAAI](https://huggingface.co/BAAI) — BGE-M3 embedding model
-* [Chroma](https://www.trychroma.com/) — vector database
-* [Streamlit](https://streamlit.io/) — application interface
+* [Bengali Wikisource](https://bn.wikisource.org/) for the source text
+* [BAAI](https://huggingface.co/BAAI) for the BGE-M3 embedding model
+* [LangChain](https://www.langchain.com/) for the RAG framework
+* [Chroma](https://www.trychroma.com/) for vector storage
+* [Google Gemini](https://ai.google.dev/) for LLM-based answer generation
+* [Streamlit](https://streamlit.io/) for the interactive user interface
 
 ---
 
-<div align="center">
+## 👨‍💻 Author
 
-**Built as a Bengali book-focused Retrieval-Augmented Generation application.**
+**Shaiful Palash**
 
-</div>
+GitHub: [@ShaifulPalash](https://github.com/ShaifulPalash)
+
+---
+
+> **A production-oriented Bengali RAG implementation combining semantic retrieval, lexical retrieval, and grounded LLM generation.**
+

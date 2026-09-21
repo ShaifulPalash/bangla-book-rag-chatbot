@@ -28,42 +28,33 @@ Face the first time this is used, then is cached locally
 slow; later runs are fast.
 """
 
+from functools import lru_cache
 from langchain_huggingface import HuggingFaceEmbeddings
 
 from src.config import EMBEDDING_MODEL, logger
 
 # Module-level cache so we only ever load the (large) model once per
 # process, no matter how many times get_embedding_model() is called.
-_embedding_model = None
 
 
+
+@lru_cache(maxsize=1)
 def get_embedding_model() -> HuggingFaceEmbeddings:
-    """
-    Returns a LangChain-compatible embedding object backed by the local
-    bge-m3 model. This object implements .embed_documents(list[str]) and
-    .embed_query(str), which is exactly the interface langchain_chroma's
-    Chroma class expects — so no extra glue code is needed anywhere else
-    in the project.
-    """
-    global _embedding_model
-    if _embedding_model is None:
-        logger.info(
-            f"Loading local embedding model '{EMBEDDING_MODEL}' "
-            f"(first run downloads ~2GB from Hugging Face and may take "
-            f"a few minutes; cached after that) ..."
-        )
-        _embedding_model = HuggingFaceEmbeddings(
-            model_name=EMBEDDING_MODEL,
-            model_kwargs={"device": "cpu"},  # no GPU required
-            # bge-m3 is trained for cosine-similarity retrieval. Normalizing
-            # every vector to unit length is what makes cosine similarity
-            # search accurate — skipping this silently hurts retrieval
-            # quality, so we set it explicitly rather than relying on a
-            # library default.
-            encode_kwargs={"normalize_embeddings": True},
-        )
-        logger.info("Embedding model loaded successfully.")
-    return _embedding_model
+    logger.info(
+        f"Loading local embedding model '{EMBEDDING_MODEL}' "
+        f"(first run downloads ~2GB from Hugging Face and may take "
+        f"a few minutes; cached after that) ..."
+    )
+
+    model = HuggingFaceEmbeddings(
+        model_name=EMBEDDING_MODEL,
+        model_kwargs={"device": "cpu"},
+        encode_kwargs={"normalize_embeddings": True},
+    )
+
+    logger.info("Embedding model loaded successfully.")
+
+    return model
 
 
 def self_test():

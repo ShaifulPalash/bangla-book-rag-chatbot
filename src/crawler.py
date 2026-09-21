@@ -1,32 +1,13 @@
 """
 src/crawler.py
-================
-Discovers and downloads every chapter of দেবদাস from Bengali Wikisource,
-cleans the raw HTML into plain text, and saves the result (with metadata)
-to data/raw_debdas.json for the next phase (chunking) to use.
+==============
 
-Why we talk to the MediaWiki API instead of scraping raw HTML pages:
-----------------------------------------------------------------------
-Bengali Wikisource runs on MediaWiki — the same software as Wikipedia.
-MediaWiki sites expose a stable, official JSON API (api.php) for exactly
-this kind of task: listing pages and fetching their content. Scraping the
-human-facing HTML pages directly (guessing URLs, hoping CSS classes never
-change) is fragile. Using the API is the standard, more robust approach:
-
-  1. list=allpages with a title "prefix" lets us DISCOVER every chapter
-     subpage automatically, instead of hardcoding "there are 16 chapters."
-     If this script were pointed at a different book with a different
-     chapter count, this discovery step would still work correctly.
-  2. action=parse gives us clean, already-rendered HTML for a page, which
-     we then strip down to just the story text using BeautifulSoup.
-
-A note on testing: this script makes real HTTP requests to
-bn.wikisource.org. It cannot be executed inside the sandboxed environment
-used to *write* this code (that environment's network access is limited
-to package registries like PyPI/npm, not general websites). It WILL work
-when you run it yourself, since your machine has normal internet access.
-Run it with:  python src/crawler.py
+Downloads all chapters of দেবদাস from Bengali Wikisource through the
+MediaWiki API, cleans the rendered HTML, validates chapter completeness,
+and saves the result to data/raw_debdas.json.
 """
+
+from __future__ import annotations
 
 import json
 import time
@@ -36,240 +17,368 @@ import requests
 from bs4 import BeautifulSoup
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-from src.config import BOOK_TITLE, BOOK_AUTHOR, RAW_BOOK_PATH, logger
+from src.config import (
+    BOOK_AUTHOR,
+    BOOK_TITLE,
+    EXPECTED_CHAPTER_COUNT,
+    RAW_BOOK_PATH,
+    logger,
+)
 
-# ---------------------------------------------------------------------------
-# Wikisource / MediaWiki API settings
-# ---------------------------------------------------------------------------
+
 API_URL = "https://bn.wikisource.org/w/api.php"
 
-# The exact MediaWiki page title for the book's main/index page.
-# (This is a page TITLE, not a URL — requests will handle encoding for us,
-# so we never have to manually percent-encode Bengali text.)
 MAIN_PAGE_TITLE = "দেবদাস (শরৎচন্দ্র চট্টোপাধ্যায়)"
 
-# Wikimedia's API etiquette policy asks every client to identify itself
-# with a descriptive User-Agent. Omitting this can lead to your requests
-# being silently rate-limited or blocked.
 HEADERS = {
     "User-Agent": (
-        "DebdasRAGChatbot/1.0 (Educational assignment project; "
-        "contact: student@example.com)"
+        "DebdasRAGChatbot/1.1 "
+        "(educational Bengali RAG project)"
     )
 }
 
-# Bengali ordinal words 1st through 16th, in correct reading order.
-# We need this because the API's allpages list comes back alphabetically,
-# not in story order — this list lets us re-sort chapters correctly and
-# assign a clean chapter_number to each one.
+
 BENGALI_ORDINALS = [
-    "প্রথম", "দ্বিতীয়", "তৃতীয়", "চতুর্থ", "পঞ্চম", "ষষ্ঠ", "সপ্তম",
-    "অষ্টম", "নবম", "দশম", "একাদশ", "দ্বাদশ", "ত্রয়োদশ", "চতুর্দশ",
-    "পঞ্চদশ", "ষোড়শ",
+    "প্রথম",
+    "দ্বিতীয়",
+    "তৃতীয়",
+    "চতুর্থ",
+    "পঞ্চম",
+    "ষষ্ঠ",
+    "সপ্তম",
+    "অষ্টম",
+    "নবম",
+    "দশম",
+    "একাদশ",
+    "দ্বাদশ",
+    "ত্রয়োদশ",
+    "চতুর্দশ",
+    "পঞ্চদশ",
+    "ষোড়শ",
 ]
 
-# Being a polite crawler: a short pause between requests so we don't
-# hammer Wikisource's servers with 16+ rapid-fire requests.
 REQUEST_DELAY_SECONDS = 0.5
 
 
+def chapter_number_from_title(title: str) -> int | None:
+    """Return the Bengali ordinal chapter number encoded in a page title."""
+
+    for index, ordinal in enumerate(BENGALI_ORDINALS, start=1):
+        if title.endswith(f"{ordinal} পরিচ্ছেদ"):
+            return index
+
+    return None
+
+
 @retry(
-    wait=wait_exponential(multiplier=1, min=2, max=20),
+    wait=wait_exponential(
+        multiplier=1,
+        min=2,
+        max=20,
+    ),
     stop=stop_after_attempt(4),
     reraise=True,
 )
 def _api_get(params: dict) -> dict:
-    """
-    Thin wrapper around requests.get() for the MediaWiki API, with
-    automatic retries (exponential backoff) for transient network errors.
-    Every other function in this file goes through here, so all API
-    calls get the same retry protection and logging for free.
-    """
-    params = {**params, "format": "json"}
-    response = requests.get(API_URL, params=params, headers=HEADERS, timeout=15)
-    response.raise_for_status()  # raises an exception on HTTP 4xx/5xx
-    return response.json()
+    """Perform one MediaWiki API request with retry protection."""
+
+    request_params = {
+        **params,
+        "format": "json",
+    }
+
+    response = requests.get(
+        API_URL,
+        params=request_params,
+        headers=HEADERS,
+        timeout=20,
+    )
+
+    response.raise_for_status()
+
+    data = response.json()
+
+    if "error" in data:
+        raise RuntimeError(
+            f"MediaWiki API error: {data['error']}"
+        )
+
+    return data
 
 
 def discover_chapter_titles() -> list[str]:
     """
-    Step 1: ask the API for every page whose title starts with
-    "দেবদাস (শরৎচন্দ্র চট্টোপাধ্যায়)/" — i.e. every chapter subpage.
+    Discover all chapter subpages using MediaWiki pagination.
 
-    Returns a list of full page titles, sorted into correct reading order
-    (প্রথম পরিচ্ছেদ, দ্বিতীয় পরিচ্ছেদ, ..., ষোড়শ পরিচ্ছেদ).
+    Only pages matching the expected Bengali chapter naming convention
+    are accepted.
     """
-    logger.info(f"Discovering chapter subpages under '{MAIN_PAGE_TITLE}' ...")
 
-    params = {
-        "action": "query",
-        "list": "allpages",
-        "apprefix": MAIN_PAGE_TITLE + "/",
-        "apnamespace": 0,       # namespace 0 = main article namespace
-        "aplimit": "max",
-    }
-    data = _api_get(params)
-    pages = data.get("query", {}).get("allpages", [])
-    titles = [p["title"] for p in pages]
+    logger.info(
+        "Discovering chapter subpages under %r...",
+        MAIN_PAGE_TITLE,
+    )
+
+    titles: list[str] = []
+    continue_token: dict | None = None
+
+    while True:
+        params = {
+            "action": "query",
+            "list": "allpages",
+            "apprefix": MAIN_PAGE_TITLE + "/",
+            "apnamespace": 0,
+            "aplimit": "max",
+        }
+
+        if continue_token:
+            params.update(continue_token)
+
+        data = _api_get(params)
+
+        pages = data.get("query", {}).get("allpages", [])
+
+        for page in pages:
+            title = page["title"]
+
+            if chapter_number_from_title(title) is not None:
+                titles.append(title)
+
+        continue_token = data.get("continue")
+
+        if not continue_token:
+            break
+
+    # Remove duplicates while preserving discovery order.
+    titles = list(dict.fromkeys(titles))
 
     if not titles:
-        # Fallback: if discovery finds nothing (e.g. API shape changed),
-        # fall back to constructing titles from our known ordinal list.
-        # This keeps the crawler working even if the primary method fails,
-        # rather than crashing with an empty book.
         logger.warning(
-            "API discovery returned no subpages — falling back to the "
-            "known 16-chapter ordinal list."
+            "API discovery returned no chapter pages. "
+            "Using the expected 16 chapter titles as a fallback."
         )
-        titles = [f"{MAIN_PAGE_TITLE}/{ordinal} পরিচ্ছেদ" for ordinal in BENGALI_ORDINALS]
 
-    # Sort into correct story order using the ordinal list, instead of
-    # trusting the API's alphabetical order.
-    def sort_key(title: str) -> int:
-        for i, ordinal in enumerate(BENGALI_ORDINALS):
-            if title.endswith(f"{ordinal} পরিচ্ছেদ"):
-                return i
-        return len(BENGALI_ORDINALS)  # unknown chapters sort last, not dropped
+        titles = [
+            f"{MAIN_PAGE_TITLE}/{ordinal} পরিচ্ছেদ"
+            for ordinal in BENGALI_ORDINALS
+        ]
 
-    titles.sort(key=sort_key)
-    logger.info(f"Discovered {len(titles)} chapter subpages.")
+    titles.sort(
+        key=lambda title: chapter_number_from_title(title) or 999
+    )
+
+    if len(titles) != EXPECTED_CHAPTER_COUNT:
+        raise RuntimeError(
+            "Chapter discovery is incomplete. "
+            f"Expected {EXPECTED_CHAPTER_COUNT} chapters but found "
+            f"{len(titles)}."
+        )
+
+    logger.info(
+        "Successfully discovered %d chapters.",
+        len(titles),
+    )
+
     return titles
 
 
 def fetch_page_html(title: str) -> str:
-    """
-    Step 2: ask the API to render a single page's wikitext into HTML,
-    exactly as a browser would see it. We'll clean this HTML down to
-    plain story text in clean_html_to_text() below.
-    """
+    """Fetch rendered HTML for one Wikisource page."""
+
     params = {
         "action": "parse",
         "page": title,
         "prop": "text",
         "redirects": 1,
     }
+
     data = _api_get(params)
-    html = data.get("parse", {}).get("text", {}).get("*", "")
+
+    html = (
+        data.get("parse", {})
+        .get("text", {})
+        .get("*", "")
+    )
+
     if not html:
-        logger.warning(f"No HTML content returned for page: {title}")
+        raise RuntimeError(
+            f"MediaWiki returned no HTML for page: {title}"
+        )
+
     return html
 
 
 def clean_html_to_text(html: str) -> str:
-    """
-    Step 3: strip a rendered Wikisource page down to just the story text.
+    """Convert rendered Wikisource HTML into clean story text."""
 
-    MediaWiki pages contain a lot of things we don't want in our knowledge
-    base: "[edit]" section links, footnote markers, navigation boxes, and
-    the "retrieved from ..." footer. We remove all of that here so the
-    embeddings (Phase 4) represent only the actual novel text.
-    """
     soup = BeautifulSoup(html, "html.parser")
 
-    # The actual article content on any MediaWiki page lives inside a
-    # <div class="mw-parser-output"> — everything outside it (sidebars,
-    # etc.) is not part of the page body to begin with, but we scope to
-    # it explicitly for clarity and safety.
-    content = soup.find("div", class_="mw-parser-output") or soup
+    content = soup.find(
+        "div",
+        class_="mw-parser-output",
+    ) or soup
 
-    # Remove elements that are structural/editorial, not story content:
     unwanted_selectors = [
-        "sup.reference",       # footnote markers like [১]
-        "span.mw-editsection",  # "[edit]" links
-        "table",                # navigation/infobox tables
-        ".noprint",              # elements MediaWiki marks as non-content
+        "sup.reference",
+        "span.mw-editsection",
+        "table",
+        ".noprint",
+        ".reference",
+        ".reflist",
+        "ol.references",
         "style",
         "script",
     ]
+
     for selector in unwanted_selectors:
         for tag in content.select(selector):
             tag.decompose()
 
-    # Extract visible text, using newlines between block elements so
-    # paragraphs don't run together into one giant line.
     text = content.get_text(separator="\n")
 
-    # Clean up common leftover noise:
-    lines = [line.strip() for line in text.split("\n")]
-    lines = [line for line in lines if line]  # drop empty lines
+    lines = [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip()
+    ]
 
-    # Drop the "... থেকে আনীত" ("retrieved from ...") footer line that
-    # MediaWiki sometimes includes, and any leftover reference bracket
-    # markers like "[১]" that survived as plain text.
     cleaned_lines = []
+
     for line in lines:
+        # Remove MediaWiki footer noise.
         if "থেকে আনীত" in line:
             continue
+
         cleaned_lines.append(line)
 
     return "\n\n".join(cleaned_lines).strip()
 
 
 def build_source_url(title: str) -> str:
-    """
-    Builds the human-clickable Wikisource URL for a page title, for use
-    as a citation source. quote() percent-encodes the Bengali text
-    correctly; safe="/()" keeps slashes and parentheses readable instead
-    of also encoding them.
-    """
-    return "https://bn.wikisource.org/wiki/" + quote(title.replace(" ", "_"), safe="/()")
+    """Build the human-readable Wikisource URL for a chapter."""
+
+    encoded_title = quote(
+        title.replace(" ", "_"),
+        safe="/()",
+    )
+
+    return (
+        "https://bn.wikisource.org/wiki/"
+        + encoded_title
+    )
 
 
 def crawl_book() -> list[dict]:
     """
-    Orchestrates the full crawl: discover chapters, fetch + clean each
-    one, and return a list of chapter records ready to be saved to disk.
-    """
-    titles = discover_chapter_titles()
-    chapters = []
+    Crawl every expected chapter.
 
-    for i, title in enumerate(titles, start=1):
-        chapter_name = title.split("/")[-1]  # e.g. "সপ্তম পরিচ্ছেদ"
-        logger.info(f"[{i}/{len(titles)}] Fetching: {chapter_name}")
+    A partial crawl is treated as an error rather than silently producing
+    an incomplete knowledge base.
+    """
+
+    titles = discover_chapter_titles()
+
+    chapters: list[dict] = []
+    failed_chapters: list[str] = []
+
+    for position, title in enumerate(titles, start=1):
+        chapter_number = chapter_number_from_title(title)
+        chapter_name = title.split("/")[-1]
+
+        logger.info(
+            "[%d/%d] Fetching %s...",
+            position,
+            len(titles),
+            chapter_name,
+        )
 
         try:
             html = fetch_page_html(title)
             text = clean_html_to_text(html)
-        except Exception as e:
-            # A single failed chapter shouldn't kill the whole crawl.
-            # We log the error clearly and move on, so a network blip on
-            # chapter 9 doesn't cost you chapters 10-16 too.
-            logger.error(f"Failed to fetch/clean '{title}': {e}")
-            continue
 
-        if not text:
-            logger.warning(f"Chapter '{chapter_name}' produced no text — skipping.")
-            continue
+            if not text:
+                raise RuntimeError(
+                    "Chapter produced empty cleaned text."
+                )
 
-        chapters.append({
-            "book_name": BOOK_TITLE,
-            "author": BOOK_AUTHOR,
-            "chapter_number": i,
-            "chapter_name": chapter_name,
-            "source_url": build_source_url(title),
-            "text": text,
-        })
+            if chapter_number is None:
+                raise RuntimeError(
+                    "Could not determine chapter number."
+                )
 
-        logger.info(f"  -> {len(text)} characters extracted.")
-        time.sleep(REQUEST_DELAY_SECONDS)  # polite crawling
+            chapters.append(
+                {
+                    "book_name": BOOK_TITLE,
+                    "author": BOOK_AUTHOR,
+                    "chapter_number": chapter_number,
+                    "chapter_name": chapter_name,
+                    "source_url": build_source_url(title),
+                    "text": text,
+                }
+            )
+
+            logger.info(
+                "  -> %d characters extracted.",
+                len(text),
+            )
+
+        except Exception as exc:
+            logger.error(
+                "Failed to fetch %s: %s",
+                chapter_name,
+                exc,
+            )
+            failed_chapters.append(chapter_name)
+
+        time.sleep(REQUEST_DELAY_SECONDS)
+
+    if failed_chapters:
+        raise RuntimeError(
+            "Crawl incomplete. Failed chapters: "
+            + ", ".join(failed_chapters)
+            + ". No incomplete raw book file was written."
+        )
+
+    chapters.sort(
+        key=lambda chapter: chapter["chapter_number"]
+    )
+
+    if len(chapters) != EXPECTED_CHAPTER_COUNT:
+        raise RuntimeError(
+            f"Expected {EXPECTED_CHAPTER_COUNT} chapters but collected "
+            f"{len(chapters)}."
+        )
 
     return chapters
 
 
-def main():
+def main() -> None:
+    """Run the complete crawler."""
+
     chapters = crawl_book()
 
-    if not chapters:
-        logger.error("Crawl produced zero chapters. Aborting save.")
-        return
+    with open(
+        RAW_BOOK_PATH,
+        "w",
+        encoding="utf-8",
+    ) as file:
+        json.dump(
+            chapters,
+            file,
+            ensure_ascii=False,
+            indent=2,
+        )
 
-    with open(RAW_BOOK_PATH, "w", encoding="utf-8") as f:
-        json.dump(chapters, f, ensure_ascii=False, indent=2)
+    total_chars = sum(
+        len(chapter["text"])
+        for chapter in chapters
+    )
 
-    total_chars = sum(len(c["text"]) for c in chapters)
     logger.info(
-        f"Crawl complete: {len(chapters)} chapters, "
-        f"{total_chars:,} total characters saved to {RAW_BOOK_PATH}"
+        "Crawl complete: %d chapters, %d total characters saved to %s.",
+        len(chapters),
+        total_chars,
+        RAW_BOOK_PATH,
     )
 
 

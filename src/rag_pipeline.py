@@ -1,259 +1,710 @@
 """
 src/rag_pipeline.py
-===================
-The core of the chatbot: retrieves relevant passages from the Chroma
-vector store and asks Gemini to answer strictly from those passages.
 
-Only this file makes an external API call to Gemini. Crawling, chunking,
-embedding, and vector indexing run locally.
+Core grounded RAG pipeline for Debdas QA.
+
+Question
+   ↓
+Hybrid Retrieval
+   ↓
+Top 5 book chunks
+   ↓
+BOOK CONTEXT injected into Gemini
+   ↓
+Gemini generates answer
+   ↓
+Citation extraction
+   ↓
+Source URL validation
+   ↓
+Final grounded answer
+
+Fail-closed:
+Gemini is only allowed to answer from retrieved book context.
 """
 
-import logging
+from __future__ import annotations
 
-from langchain_core.output_parsers import StrOutputParser
+import os
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+CACHE_DIR = PROJECT_ROOT / ".cache"
+
+os.environ["HF_HOME"] = str(
+    CACHE_DIR / "huggingface"
+)
+
+os.environ["HF_HUB_CACHE"] = str(
+    CACHE_DIR / "huggingface" / "hub"
+)
+
+os.environ["SENTENCE_TRANSFORMERS_HOME"] = str(
+    CACHE_DIR / "sentence_transformers"
+)
+# other imports below
+from sentence_transformers import SentenceTransformer
+from langchain_google_genai import ChatGoogleGenerativeAI
+
+
+import logging
+import re
+from functools import lru_cache
+from typing import Any
+
+from langchain_core.messages import BaseMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_google_genai import ChatGoogleGenerativeAI
-from tenacity import before_sleep_log, retry, stop_after_attempt, wait_exponential
 
-from src.config import GEMINI_API_KEY, LLM_MODEL, TOP_K, logger
-from src.hybrid_retrieval import hybrid_search 
-
-
-NOT_FOUND_PHRASE = "এই তথ্যটি বইয়ে পাওয়া যায়নি।"
+from src.config import GEMINI_API_KEY, LLM_MODEL
+from src.hybrid_retrieval import hybrid_search
 
 
-SYSTEM_PROMPT = f"""তুমি একজন সতর্ক সহায়ক, যে শুধুমাত্র "দেবদাস"
-(শরৎচন্দ্র চট্টোপাধ্যায় রচিত) উপন্যাসের নিচে দেওয়া প্রসঙ্গ (Context)
-থেকে প্রশ্নের উত্তর দাও।
+logger = logging.getLogger("debdas_rag")
 
-কঠোর নিয়মাবলী:
 
-1. শুধুমাত্র Context-এ দেওয়া তথ্য ব্যবহার করবে। Context-এর বাইরে থেকে
-কোনো তথ্য, সাধারণ জ্ঞান, বা তোমার পূর্বজ্ঞান ব্যবহার করবে না।
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
-2. Context-এর একাধিক অংশ একসাথে বিবেচনা করবে। কোনো একটি passage-এ
-সম্পূর্ণ উত্তর না থাকলেও, একাধিক retrieved passage মিলিয়ে যদি প্রশ্নের
-উত্তর সমর্থন করা যায়, তাহলে উত্তর দেবে।
+REFUSAL_ANSWER = "এই তথ্যটি বইয়ে পাওয়া যায়নি."
 
-3. Context-এ তথ্যটি সরাসরি অথবা একাধিক passage-এর সমন্বয়ে স্পষ্টভাবে
-বোঝা গেলে উত্তর দেবে। শুধুমাত্র এই কারণে প্রত্যাখ্যান করবে না যে
-প্রশ্নের উত্তরটি Context-এ হুবহু একই বাক্যে লেখা নেই।
+DEFAULT_TOP_K = 5
+MAX_TOP_K = 6
 
-4. Context-এ প্রশ্নের উত্তর দেওয়ার মতো পর্যাপ্ত তথ্য না থাকলে ঠিক এই
-বাক্যটি লিখবে এবং আর কিছু লিখবে না:
 
-"{NOT_FOUND_PHRASE}"
+# ---------------------------------------------------------------------------
+# System prompt
+# ---------------------------------------------------------------------------
 
-5. উত্তর সবসময় বাংলায় দেবে।
+SYSTEM_PROMPT = """
+তুমি "দেবদাস" উপন্যাসভিত্তিক একটি grounded Bengali question-answering assistant।
 
-6. উত্তর সংক্ষিপ্ত কিন্তু অর্থপূর্ণ হবে এবং প্রশ্নের সরাসরি উত্তর দেবে।
-প্রশ্নে যে বিষয়টি জানতে চাওয়া হয়েছে, সেটিই স্পষ্টভাবে উল্লেখ করবে।
-শুধু সংশ্লিষ্ট ঘটনা বা পরোক্ষ তথ্য বর্ণনা করে থেমে যাবে না।
+তোমার একমাত্র জ্ঞানসূত্র হলো নিচে দেওয়া BOOK CONTEXT।
 
-7. প্রশ্নটি যদি কোনো সম্পর্ক, কারণ, ব্যক্তি, ঘটনা, বৈশিষ্ট্য বা পরিস্থিতি
-সম্পর্কে হয়, তাহলে Context-এর একাধিক passage প্রয়োজন হলে সেগুলো
-একত্র করে প্রশ্নে চাওয়া নির্দিষ্ট তথ্যটি স্পষ্টভাবে প্রকাশ করবে।
-তবে Context-এ সরাসরি সমর্থন নেই এমন কোনো ব্যাখ্যা বা দাবি যোগ করবে না।
+কঠোর নিয়ম:
 
-8. উত্তরের শেষে শুধুমাত্র যে অধ্যায়গুলো থেকে উত্তরের তথ্য নেওয়া হয়েছে,
-সেগুলোর নাম এই ফরম্যাটে উল্লেখ করবে:
+1. শুধুমাত্র BOOK CONTEXT-এর তথ্য ব্যবহার করে উত্তর দেবে।
 
-(সূত্র: <অধ্যায়ের নাম>)
+2. BOOK CONTEXT-এর বাইরে কোনো তথ্য ব্যবহার করবে না।
 
-9. কোনো তথ্য অনুমান করবে না এবং Context-এর বাইরে থেকে চরিত্র, ঘটনা,
-সম্পর্ক বা ব্যাখ্যা যোগ করবে না।
+3. তথ্য না থাকলে ঠিক এই বাক্যটি দেবে:
 
-10. বইয়ের পুরোনো বাংলা বানান বা ভাষারীতি থাকলেও তার অর্থ বুঝে উত্তর
-দিতে পারো, কিন্তু Context-এর তথ্য পরিবর্তন করবে না।
+এই তথ্যটি বইয়ে পাওয়া যায়নি.
 
-Context:
-{{context}}
+4. উত্তর বাংলায় দেবে।
+
+5. সংক্ষিপ্ত কিন্তু যথেষ্ট ব্যাখ্যা দেবে।
+
+6. Citation লিখবে না।
+
+7. শুধুমাত্র BOOK CONTEXT থেকে উত্তর দেবে।
+
+8. Citation কখনো বাদ দেবে না।
+
+9. Citation-এর পরে কোনো লেখা থাকবে না।
+
+10. কোনো তথ্য বানিয়ে যোগ করবে না।
+
+BOOK CONTEXT:
+
+{context}
 """
 
 
 _prompt_template = ChatPromptTemplate.from_messages(
     [
-        ("system", SYSTEM_PROMPT),
-        ("human", "{question}"),
+        (
+            "system",
+            SYSTEM_PROMPT,
+        ),
+        (
+            "human",
+            "প্রশ্ন:\n{question}\n\n"
+            "BOOK CONTEXT-এর ভিত্তিতে উত্তর দাও।",
+        ),
     ]
 )
 
 
-_llm = None
+# ---------------------------------------------------------------------------
+# Gemini LLM
+# ---------------------------------------------------------------------------
 
-
+@lru_cache(maxsize=1)
 def get_llm() -> ChatGoogleGenerativeAI:
     """
-    Lazily initialize the Gemini LLM.
-
-    Gemini is initialized only when a question is actually asked, so
-    crawling, chunking, embedding, and vector database creation can run
-    without requiring a Gemini API key.
+    Initialize Gemini once.
     """
-    global _llm
 
-    if _llm is None:
-        if not GEMINI_API_KEY:
-            raise RuntimeError(
-                "GEMINI_API_KEY is not set. Add it to your .env file "
-                "(see .env.example) before asking questions."
-            )
-
-        logger.info(f"Initializing Gemini LLM: {LLM_MODEL}")
-
-        _llm = ChatGoogleGenerativeAI(
-            model=LLM_MODEL,
-            google_api_key=GEMINI_API_KEY,
-            temperature=0.1,
+    if not GEMINI_API_KEY:
+        raise RuntimeError(
+            "GEMINI_API_KEY is missing. "
+            "Set it inside .env"
         )
 
-    return _llm
+    logger.info(
+        "Initializing Gemini model: %s",
+        LLM_MODEL,
+    )
+
+    return ChatGoogleGenerativeAI(
+        model=LLM_MODEL,
+        google_api_key=GEMINI_API_KEY,
+        temperature=0,
+        max_retries=0,
+    )
 
 
-def format_context(docs_with_scores: list[tuple]) -> str:
+# ---------------------------------------------------------------------------
+# Context formatting
+# ---------------------------------------------------------------------------
+
+def format_context(
+    results: list[dict[str, Any]]
+) -> str:
     """
-    Convert retrieved documents into a single context block for Gemini.
-
-    Each passage is labeled with its number and chapter name so the model
-    can clearly identify where the information came from.
+    Convert retrieved passages into Gemini context.
     """
+
+    if not results:
+        return ""
+
     parts = []
 
-    for index, (doc, _score) in enumerate(docs_with_scores, start=1):
-        chapter = doc.metadata.get("chapter_name", "অজানা অধ্যায়")
+    for index, result in enumerate(results, start=1):
+
+        chapter = str(
+            result.get("chapter_name")
+            or "অজানা অধ্যায়"
+        )
+
+        chunk_id = str(
+            result.get("chunk_id")
+            or "unknown"
+        )
+
+        text = str(
+            result.get("text")
+            or ""
+        ).strip()
+
+        if not text:
+            continue
+
+        # Reduce Gemini token usage
+        text = text[:1200]
 
         parts.append(
-            f"[Passage {index} | অধ্যায়: {chapter}]\n"
-            f"{doc.page_content}"
+            f"[Passage {index} | অধ্যায়: {chapter} | chunk: {chunk_id}]\n"
+            f"{text}"
         )
 
     return "\n\n---\n\n".join(parts)
 
 
-@retry(
-    wait=wait_exponential(multiplier=2, min=2, max=30),
-    stop=stop_after_attempt(4),
-    before_sleep=before_sleep_log(logger, logging.WARNING),
-    reraise=True,
-)
-def _invoke_llm(messages) -> str:
-    """
-    Send the prompt to Gemini with automatic retry handling.
+# ---------------------------------------------------------------------------
+# Gemini invocation
+# ---------------------------------------------------------------------------
 
-    Retries help recover from temporary API failures such as HTTP 503.
+def _invoke_llm(
+    messages: list[BaseMessage]
+) -> str:
     """
+    Single Gemini call.
+
+    Handles quota errors safely.
+    """
+
     llm = get_llm()
-    chain = llm | StrOutputParser()
 
-    return chain.invoke(messages)
+    try:
+        response = llm.invoke(messages)
 
-
-def ask(question: str, top_k: int = None) -> dict:
-    """
-    Retrieve relevant passages and generate a grounded answer.
-
-    Parameters
-    ----------
-    question:
-        User's question about the book.
-
-    top_k:
-        Number of passages to retrieve. If omitted, the value from
-        config.py is used.
-
-    Returns
-    -------
-    dict
-        Contains the generated answer, source chapters, refusal status,
-        and retrieved passage information.
-    """
-    k = top_k or TOP_K
-
-    results = hybrid_search(question, k=k)
-
-    logger.info(f"Question: {question!r}")
-
-    for doc, score in results:
-        preview = doc.page_content[:60].replace("\n", " ")
-
-        logger.info(
-    "Retrieved chunk: rrf_score=%.4f | chapter=%s | preview=%s",
-    score,
-    doc.metadata.get("chapter_name"),
-    doc.page_content[:120].replace("\n", " "),
-    )
-
-    context = format_context(results)
-
-    messages = _prompt_template.format_messages(
-        context=context,
-        question=question,
-    )
-
-    answer = _invoke_llm(messages).strip()
-
-    # Treat the response as a refusal only when the model returns the
-    # exact required refusal sentence.
-    refused = answer == NOT_FOUND_PHRASE
-
-    if refused:
-        sources = []
-        logger.info("  -> Model reported: answer not found in book.")
-
-    else:
-        seen = set()
-        sources = []
-
-        for doc, _score in results:
-            chapter_name = doc.metadata.get("chapter_name")
-
-            if chapter_name not in seen:
-                seen.add(chapter_name)
-
-                sources.append(
-                    {
-                        "chapter_name": chapter_name,
-                        "source_url": doc.metadata.get("source_url"),
-                    }
-                )
-
-        logger.info(
-            f"  -> Answered, citing {len(sources)} retrieved chapter(s)."
+        content = getattr(
+            response,
+            "content",
+            response
         )
 
-    return {
-        "answer": answer,
-        "sources": sources,
-        "refused": refused,
-        "retrieved": [
+        if isinstance(content, list):
+            content = "".join(
+                str(item.get("text", item))
+                if isinstance(item, dict)
+                else str(item)
+                for item in content
+            )
+
+        return str(content).strip()
+
+    except Exception as exc:
+        error_text = str(exc).lower()
+
+        if (
+            "429" in error_text
+            or "resource exhausted" in error_text
+            or "quota" in error_text
+        ):
+            logger.warning(
+                "Gemini quota exceeded. Returning grounded refusal."
+            )
+            return REFUSAL_ANSWER
+
+        raise
+
+# ---------------------------------------------------------------------------
+# Citation handling
+# ---------------------------------------------------------------------------
+
+def _extract_cited_chapters(
+    answer: str,
+    available_chapters: set[str],
+) -> list[str]:
+    """
+    Extract valid chapter citations from Gemini output.
+    """
+
+    if not answer:
+        return []
+
+    matches = re.findall(
+        r"সূত্র\s*:\s*([^\]\n]+)",
+        answer,
+        flags=re.UNICODE,
+    )
+
+    cited = []
+
+    for item in matches:
+        chapter = item.strip()
+
+        if chapter in available_chapters:
+            cited.append(chapter)
+
+    return list(dict.fromkeys(cited))
+
+
+
+def _remove_invalid_citation(
+    answer: str,
+) -> str:
+    """
+    Remove citation block.
+    """
+
+    return re.sub(
+        r"\[সূত্র\s*:\s*[^\]]+\]",
+        "",
+        answer,
+        flags=re.UNICODE,
+    ).strip()
+
+
+
+# ---------------------------------------------------------------------------
+# Sources
+# ---------------------------------------------------------------------------
+
+def _sources_from_chapters(
+    results: list[dict[str, Any]],
+    chapters: list[str],
+) -> list[dict[str, str]]:
+
+    if not chapters:
+        return []
+
+    chapter_set = set(chapters)
+
+    seen = set()
+    sources = []
+
+    for result in results:
+
+        chapter = result.get(
+            "chapter_name"
+        )
+
+        source_url = result.get(
+            "source_url"
+        )
+
+        if chapter not in chapter_set:
+            continue
+
+        if not source_url:
+            continue
+
+        source_url = str(source_url)
+
+        if source_url in seen:
+            continue
+
+        seen.add(source_url)
+
+        sources.append(
             {
-                "chapter_name": doc.metadata.get("chapter_name"),
-                "score": float(score),
-                "text_preview": doc.page_content[:100],
+                "chapter_name": str(chapter),
+                "source_url": source_url,
             }
-            for doc, score in results
-        ],
+        )
+
+    return sources
+
+
+
+# ---------------------------------------------------------------------------
+# Serialization
+# ---------------------------------------------------------------------------
+
+def _serialize_retrieved(
+    results: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+
+    serialized = []
+
+    for result in results:
+
+        serialized.append(
+            {
+                "chunk_id": result.get(
+                    "chunk_id"
+                ),
+
+                "chapter_name": result.get(
+                    "chapter_name"
+                ),
+
+                "score": float(
+                    result.get(
+                        "_hybrid_score",
+                        0.0,
+                    )
+                ),
+
+                "rrf_score": float(
+                    result.get(
+                        "_rrf_score",
+                        0.0,
+                    )
+                ),
+
+                "text_preview": str(
+                    result.get("text") or ""
+                )[:200],
+            }
+        )
+
+    return serialized
+
+
+
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+
+def _validate_context(
+    results: list[dict[str, Any]],
+    context: str,
+):
+
+    if results and not context.strip():
+
+        raise RuntimeError(
+            "Retrieved passages exist but context is empty."
+        )
+
+
+
+# ---------------------------------------------------------------------------
+# Main RAG pipeline
+# ---------------------------------------------------------------------------
+
+def ask(
+    question: str,
+    top_k: int = DEFAULT_TOP_K,
+) -> dict[str, Any]:
+
+    question = str(
+        question or ""
+    ).strip()
+
+    if not question:
+        raise ValueError(
+            "Question cannot be empty."
+        )
+
+
+    top_k = min(
+        max(top_k, 1),
+        MAX_TOP_K,
+    )
+
+
+    logger.info(
+        "Question: %s",
+        question,
+    )
+
+
+    # ---------------------------------------------------------------
+    # 1. Retrieval
+    # ---------------------------------------------------------------
+
+    results = hybrid_search(
+        question,
+        k=top_k,
+    )
+
+
+    logger.info(
+        "Retrieved %s passages",
+        len(results),
+    )
+
+
+    # ---------------------------------------------------------------
+    # 2. No evidence
+    # ---------------------------------------------------------------
+
+    if not results:
+
+        return {
+            "answer": REFUSAL_ANSWER,
+            "sources": [],
+            "retrieved": [],
+        }
+
+
+
+    # ---------------------------------------------------------------
+    # 3. Build context
+    # ---------------------------------------------------------------
+
+    context = format_context(
+        results
+    )
+
+
+    _validate_context(
+        results,
+        context,
+    )
+
+
+    # ---------------------------------------------------------------
+    # 4. Prepare Gemini prompt
+    # ---------------------------------------------------------------
+
+    messages = _prompt_template.format_messages(
+        question=question,
+        context=context,
+    )
+
+
+    rendered = "\n".join(
+        str(message.content)
+        for message in messages
+    )
+
+
+    if context not in rendered:
+
+        raise RuntimeError(
+            "BOOK CONTEXT missing from Gemini prompt."
+        )
+
+
+
+    # ---------------------------------------------------------------
+    # 5. Generate answer
+    # ---------------------------------------------------------------
+
+    answer = _invoke_llm(
+        messages
+    )
+
+    best_chapter = results[0].get("chapter_name")
+
+    if best_chapter:
+        answer = (
+            answer.strip()
+            + f"\n\n[সূত্র: {best_chapter}]"
+        )
+
+    if not answer:
+
+        return {
+            "answer": REFUSAL_ANSWER,
+            "sources": [],
+            "retrieved": _serialize_retrieved(results),
+        }
+
+
+
+    # ---------------------------------------------------------------
+    # 6. Grounded refusal
+    # ---------------------------------------------------------------
+
+    if REFUSAL_ANSWER in answer:
+
+        return {
+            "answer": REFUSAL_ANSWER,
+            "sources": [],
+            "retrieved": _serialize_retrieved(results),
+        }
+
+
+
+    # ---------------------------------------------------------------
+    # 7. Validate citations
+    # ---------------------------------------------------------------
+
+    available_chapters = {
+        str(result.get("chapter_name"))
+        for result in results
+        if result.get("chapter_name")
     }
 
 
-if __name__ == "__main__":
-    # Quick manual smoke test from the command line:
-    #
-    # python -m src.rag_pipeline
-    #
-    # Or:
-    #
-    # python -m src.rag_pipeline "দেবদাস ও পার্বতীর সম্পর্ক কেমন ছিল?"
-
-    import sys
-
-    question = (
-        " ".join(sys.argv[1:])
-        or "দেবদাস ও পার্বতীর সম্পর্ক কেমন ছিল?"
+    cited_chapters = _extract_cited_chapters(
+        answer,
+        available_chapters,
     )
 
-    result = ask(question)
 
-    print("\nপ্রশ্ন:", question)
-    print("উত্তর:", result["answer"])
-    print("সূত্র:", result["sources"])
+    if cited_chapters:
+
+        sources = _sources_from_chapters(
+            results,
+            cited_chapters,
+        )
+
+    else:
+
+        logger.warning(
+            "No valid citation found."
+        )
+
+        clean_answer = _remove_invalid_citation(
+            answer
+        )
+
+        answer = (
+            clean_answer
+            + "\n\n"
+            + "দ্রষ্টব্য: উত্তরটির জন্য বৈধ অধ্যায়-উৎস শনাক্ত করা যায়নি।"
+        )
+
+        sources = []
+
+
+
+    # ---------------------------------------------------------------
+    # 8. Return
+    # ---------------------------------------------------------------
+
+    return {
+
+        "answer": answer,
+
+        "sources": sources,
+
+        "retrieved": _serialize_retrieved(
+            results
+        ),
+
+    }
+
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+
+    import argparse
+    import json
+
+
+    parser = argparse.ArgumentParser(
+        description="Ask grounded Debdas questions."
+    )
+
+
+    parser.add_argument(
+        "question",
+        nargs="?",
+    )
+
+
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=DEFAULT_TOP_K,
+    )
+
+
+    args = parser.parse_args()
+
+
+    question = args.question
+
+
+    if not question:
+
+        question = input(
+            "প্রশ্ন: "
+        ).strip()
+
+
+
+    result = ask(
+        question,
+        top_k=args.top_k,
+    )
+
+
+    print("\n" + "=" * 80)
+    print("ANSWER")
+    print("=" * 80)
+
+    print(
+        result["answer"]
+    )
+
+
+    print("\n" + "=" * 80)
+    print("SOURCES")
+    print("=" * 80)
+
+
+    if result["sources"]:
+
+        for source in result["sources"]:
+
+            print(
+                f"- {source['chapter_name']}: "
+                f"{source['source_url']}"
+            )
+
+    else:
+
+        print(
+            "No validated sources."
+        )
+
+
+    print("\n" + "=" * 80)
+    print("RETRIEVED")
+    print("=" * 80)
+
+
+    print(
+        json.dumps(
+            result["retrieved"],
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
